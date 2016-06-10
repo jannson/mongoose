@@ -9,6 +9,10 @@
 #define MAX_IDLE_CONNS 5
 #define CONN_IDLE_TIMEOUT 30
 
+// ./load_balancer -p 8090 -l -  -k  -b / 192.168.6.1:80
+// openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1000 -nodes
+// cat key.pem > ssl.pem; cat cert.pem >> ssl.pem
+
 struct http_backend;
 
 struct be_conn {
@@ -127,10 +131,12 @@ static struct http_backend *choose_backend_from_list(
     vhost_end++;
   }
   vhost.len = vhost_end - vhost.p;
+  printf("vhost.p=%s\n", vhost.p);
 
   struct http_backend *chosen = NULL;
   for (i = 0; i < num_backends; i++) {
     struct http_backend *be = &backends[i];
+    printf("be->vhost=%s hm->uri=%s prefix=%s\n", be->vhost, hm->uri.p, be->uri_prefix);
     if (has_prefix(&hm->uri, be->uri_prefix) &&
         matches_vhost(&vhost, be->vhost) &&
         (chosen == NULL ||
