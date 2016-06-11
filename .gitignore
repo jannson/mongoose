@@ -34,3 +34,4 @@ examples/websocket_chat/websocket_chat
 examples/websocket_chat_client/websocket_chat_client
 examples/hack/hook.so
 examples/httpdb/http
+examples/httpdb/web_root

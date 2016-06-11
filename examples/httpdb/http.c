@@ -68,6 +68,7 @@ static int s_num_vhost_backends = 0, s_num_default_backends = 0;
 static int s_sig_num = 0;
 static int s_backend_keepalive = 0;
 static FILE *s_log_file = NULL;
+static struct mg_serve_http_opts s_http_server_opts = {0};
 #ifdef MG_ENABLE_SSL
 const char *s_ssl_cert = NULL;
 #endif
@@ -474,7 +475,7 @@ static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int http
       assert(conn->be_conn == NULL);
       struct http_message *hm = (struct http_message *) ev_data;
 
-      if(hm != NULL && has_prefix(&hm->uri, "/_ks/")) {
+      if(hm != NULL && has_prefix(&hm->uri, "/_api/")) {
           //printf("json connected\n");
           mg_printf(nc, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n"
                     "Content-Type: application/json\r\n\r\n{}");
@@ -482,6 +483,12 @@ static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int http
           //Set Client.nc to NULL
           conn->client.nc = NULL;
           break;
+      } else if(hm != NULL && has_prefix(&hm->uri, "/_root/")) {
+        //rewrite uri
+        hm->uri.p += 6;
+        hm->uri.len -= 6;
+        mg_serve_http(nc, hm, s_http_server_opts); /* Serve static content */
+        break;
       } else {
           conn->client.flags.keep_alive = is_keep_alive(hm);
           if (!connect_backend(conn, hm)) {
@@ -572,7 +579,7 @@ static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int http
       }
 
       if (conn->client.nc == NULL && conn->backend.nc == NULL) {
-        printf("free conn conn=0x%02x\n", conn);
+        //printf("free conn conn=0x%02x\n", conn);
         free(conn);
       }
 
@@ -604,6 +611,9 @@ int main(int argc, char *argv[]) {
   redirect = 0;
   vhost = NULL;
   s_ssl_cert = "./ssl.pem";
+  s_http_server_opts.document_root = "web_root";
+  //s_http_server_opts.enable_directory_listing = "no";
+  //s_http_server_opts.url_rewrites = "/_root=/web_root";
 
   struct http_backend *be =
       vhost != NULL ? &s_vhost_backends[s_num_vhost_backends++]
