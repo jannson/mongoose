@@ -2119,9 +2119,6 @@ const char *c_strnstr(const char *s, const char *find, size_t slen) {
 #define intptr_t long
 #endif
 
-int mg_is_error(int n);
-void mg_set_non_blocking_mode(sock_t sock);
-
 extern void mg_ev_mgr_init(struct mg_mgr *mgr);
 extern void mg_ev_mgr_free(struct mg_mgr *mgr);
 extern void mg_ev_mgr_add_conn(struct mg_connection *nc);
@@ -2204,7 +2201,7 @@ void mg_if_timer(struct mg_connection *c, double now) {
 }
 
 void mg_if_poll(struct mg_connection *nc, time_t now) {
-  if (nc->ssl == NULL || (nc->flags & MG_F_SSL_HANDSHAKE_DONE)) {
+  if (!(nc->flags & MG_F_SSL) || (nc->flags & MG_F_SSL_HANDSHAKE_DONE)) {
     mg_call(nc, NULL, MG_EV_POLL, &now);
   }
 }
@@ -2214,7 +2211,7 @@ static void mg_destroy_conn(struct mg_connection *conn) {
     conn->proto_data_destructor(conn->proto_data);
   }
   mg_if_destroy_conn(conn);
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL) && !defined(MG_SOCKET_SIMPLELINK)
   if (conn->ssl != NULL) SSL_free(conn->ssl);
   if (conn->ssl_ctx != NULL) SSL_CTX_free(conn->ssl_ctx);
 #endif
@@ -2250,7 +2247,7 @@ void mg_mgr_init(struct mg_mgr *m, void *user_data) {
   signal(SIGPIPE, SIG_IGN);
 #endif
 
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL) && !defined(MG_SOCKET_SIMPLELINK)
   {
     static int init_done;
     if (!init_done) {
@@ -2484,6 +2481,8 @@ MG_INTERNAL int mg_parse_address(const char *str, union socket_address *sa,
 }
 
 #ifdef MG_ENABLE_SSL
+
+#ifndef MG_SOCKET_SIMPLELINK
 /*
  * Certificate generation script is at
  * https://github.com/cesanta/mongoose/blob/master/scripts/generate_ssl_certificates.sh
@@ -2559,13 +2558,13 @@ static int mg_use_ca_cert(SSL_CTX *ctx, const char *cert) {
   return SSL_CTX_load_verify_locations(ctx, cert, NULL) == 1 ? 0 : -2;
 }
 
-static int mg_use_cert(SSL_CTX *ctx, const char *pem_file) {
+static int mg_use_cert(SSL_CTX *ctx, const char *cert, const char *key) {
   if (ctx == NULL) {
     return -1;
-  } else if (pem_file == NULL || pem_file[0] == '\0') {
+  } else if (cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0') {
     return 0;
-  } else if (SSL_CTX_use_certificate_file(ctx, pem_file, 1) == 0 ||
-             SSL_CTX_use_PrivateKey_file(ctx, pem_file, 1) == 0) {
+  } else if (SSL_CTX_use_certificate_file(ctx, cert, 1) == 0 ||
+             SSL_CTX_use_PrivateKey_file(ctx, key, 1) == 0) {
     return -2;
   } else {
 #ifndef MG_DISABLE_PFS
@@ -2573,7 +2572,7 @@ static int mg_use_cert(SSL_CTX *ctx, const char *pem_file) {
     DH *dh = NULL;
 
     /* Try to read DH parameters from the cert/key file. */
-    bio = BIO_new_file(pem_file, "r");
+    bio = BIO_new_file(cert, "r");
     if (bio != NULL) {
       dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
       BIO_free(bio);
@@ -2594,7 +2593,7 @@ static int mg_use_cert(SSL_CTX *ctx, const char *pem_file) {
     }
 #endif
     SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_use_certificate_chain_file(ctx, pem_file);
+    SSL_CTX_use_certificate_chain_file(ctx, cert);
     return 0;
   }
 }
@@ -2615,14 +2614,17 @@ static int mg_use_cert(SSL_CTX *ctx, const char *pem_file) {
  *
  * Return NULL on success, or error message on failure.
  */
-const char *mg_set_ssl(struct mg_connection *nc, const char *cert,
-                       const char *ca_cert) {
+static const char *mg_set_ssl2(struct mg_connection *nc, const char *cert,
+                               const char *key, const char *ca_cert) {
   const char *result = NULL;
-  DBG(("%p %s %s", nc, (cert ? cert : ""), (ca_cert ? ca_cert : "")));
+  DBG(("%p %s,%s,%s", nc, (cert ? cert : ""), (key ? key : ""),
+       (ca_cert ? ca_cert : "")));
 
   if (nc->flags & MG_F_UDP) {
     return "SSL for UDP is not supported";
   }
+
+  if (key == NULL && cert != NULL) key = cert;
 
   if (nc->ssl != NULL) {
     SSL_free(nc->ssl);
@@ -2639,26 +2641,34 @@ const char *mg_set_ssl(struct mg_connection *nc, const char *cert,
   } else if (!(nc->flags & MG_F_LISTENING) &&
              (nc->ssl_ctx = SSL_CTX_new(SSLv23_client_method())) == NULL) {
     result = "SSL_CTX_new() failed";
-  } else if (mg_use_cert(nc->ssl_ctx, cert) != 0) {
+  } else if (mg_use_cert(nc->ssl_ctx, cert, key) != 0) {
     result = "Invalid ssl cert";
   } else if (mg_use_ca_cert(nc->ssl_ctx, ca_cert) != 0) {
     result = "Invalid CA cert";
   } else if (!(nc->flags & MG_F_LISTENING) &&
              (nc->ssl = SSL_new(nc->ssl_ctx)) == NULL) {
     result = "SSL_new() failed";
-  } else if (!(nc->flags & MG_F_LISTENING) && nc->sock != INVALID_SOCKET) {
-    /*
-     * Socket is open here only if we are connecting to IP address
-     * and does not open if we are connecting using async DNS resolver
-     */
-    SSL_set_fd(nc->ssl, nc->sock);
   }
 
 #ifndef MG_DISABLE_PFS
   SSL_CTX_set_cipher_list(nc->ssl_ctx, mg_s_cipher_list);
 #endif
+
+  if (result == NULL) nc->flags |= MG_F_SSL;
+
   return result;
 }
+
+const char *mg_set_ssl(struct mg_connection *nc, const char *cert,
+                       const char *ca_cert) {
+  return mg_set_ssl2(nc, cert, NULL, ca_cert);
+}
+
+#else
+const char *mg_set_ssl2(struct mg_connection *nc, const char *cert,
+                        const char *key, const char *ca_cert);
+#endif /* MG_SOCKET_SIMPLELINK */
+
 #endif /* MG_ENABLE_SSL */
 
 struct mg_connection *mg_if_accept_new_conn(struct mg_connection *lc) {
@@ -2671,9 +2681,9 @@ struct mg_connection *mg_if_accept_new_conn(struct mg_connection *lc) {
   nc->proto_handler = lc->proto_handler;
   nc->user_data = lc->user_data;
   nc->recv_mbuf_limit = lc->recv_mbuf_limit;
+  if (lc->flags & MG_F_SSL) nc->flags |= MG_F_SSL;
   mg_add_conn(nc->mgr, nc);
-  DBG(("%p %p %d %d, %p %p", lc, nc, nc->sock, (int) nc->flags, lc->ssl_ctx,
-       nc->ssl));
+  DBG(("%p %p %d %d", lc, nc, nc->sock, (int) nc->flags));
   return nc;
 }
 
@@ -2875,20 +2885,28 @@ struct mg_connection *mg_connect_opt(struct mg_mgr *mgr, const char *address,
 
   if ((nc = mg_create_connection(mgr, callback, add_sock_opts)) == NULL) {
     return NULL;
-  } else if ((rc = mg_parse_address(address, &nc->sa, &proto, host,
-                                    sizeof(host))) < 0) {
+  }
+
+  if ((rc = mg_parse_address(address, &nc->sa, &proto, host, sizeof(host))) <
+      0) {
     /* Address is malformed */
     MG_SET_PTRPTR(opts.error_string, "cannot parse address");
     mg_destroy_conn(nc);
     return NULL;
   }
+
   nc->flags |= opts.flags & _MG_ALLOWED_CONNECT_FLAGS_MASK;
   nc->flags |= (proto == SOCK_DGRAM) ? MG_F_UDP : 0;
   nc->user_data = opts.user_data;
 
 #ifdef MG_ENABLE_SSL
+  DBG(("%p %s %s %s %s", nc, address, (opts.ssl_cert ? opts.ssl_cert : ""),
+       (opts.ssl_key ? opts.ssl_key : ""),
+       (opts.ssl_ca_cert ? opts.ssl_ca_cert : "")));
+
   if (opts.ssl_cert != NULL || opts.ssl_ca_cert != NULL) {
-    const char *err = mg_set_ssl(nc, opts.ssl_cert, opts.ssl_ca_cert);
+    const char *err =
+        mg_set_ssl2(nc, opts.ssl_cert, opts.ssl_key, opts.ssl_ca_cert);
     if (err != NULL) {
       MG_SET_PTRPTR(opts.error_string, err);
       mg_destroy_conn(nc);
@@ -2899,6 +2917,8 @@ struct mg_connection *mg_connect_opt(struct mg_mgr *mgr, const char *address,
       if (opts.ssl_server_name == NULL) opts.ssl_server_name = host;
 #ifdef SSL_KRYPTON
       SSL_CTX_kr_set_verify_name(nc->ssl_ctx, opts.ssl_server_name);
+#elif defined(MG_SOCKET_SIMPLELINK)
+      nc->ssl_server_name = strdup(opts.ssl_server_name);
 #else
       /* TODO(rojer): Implement server name verification on OpenSSL. */
       MG_SET_PTRPTR(opts.error_string,
@@ -2970,8 +2990,25 @@ struct mg_connection *mg_bind_opt(struct mg_mgr *mgr, const char *address,
 
   nc->sa = sa;
   nc->flags |= MG_F_LISTENING;
-  if (proto == SOCK_DGRAM) {
-    nc->flags |= MG_F_UDP;
+  if (proto == SOCK_DGRAM) nc->flags |= MG_F_UDP;
+
+#ifdef MG_ENABLE_SSL
+  DBG(("%p %s %s %s %s", nc, address, (opts.ssl_cert ? opts.ssl_cert : ""),
+       (opts.ssl_key ? opts.ssl_key : ""),
+       (opts.ssl_ca_cert ? opts.ssl_ca_cert : "")));
+
+  if (opts.ssl_cert != NULL || opts.ssl_ca_cert != NULL) {
+    const char *err =
+        mg_set_ssl2(nc, opts.ssl_cert, opts.ssl_key, opts.ssl_ca_cert);
+    if (err != NULL) {
+      MG_SET_PTRPTR(opts.error_string, err);
+      mg_destroy_conn(nc);
+      return NULL;
+    }
+  }
+#endif /* MG_ENABLE_SSL */
+
+  if (nc->flags & MG_F_UDP) {
     rc = mg_if_listen_udp(nc, &nc->sa);
   } else {
     rc = mg_if_listen_tcp(nc, &nc->sa);
@@ -2982,16 +3019,6 @@ struct mg_connection *mg_bind_opt(struct mg_mgr *mgr, const char *address,
     mg_destroy_conn(nc);
     return NULL;
   }
-#ifdef MG_ENABLE_SSL
-  if (opts.ssl_cert != NULL || opts.ssl_ca_cert != NULL) {
-    const char *err = mg_set_ssl(nc, opts.ssl_cert, opts.ssl_ca_cert);
-    if (err != NULL) {
-      MG_SET_PTRPTR(opts.error_string, err);
-      mg_destroy_conn(nc);
-      return NULL;
-    }
-  }
-#endif /* MG_ENABLE_SSL */
   mg_add_conn(nc->mgr, nc);
 
   return nc;
@@ -3122,7 +3149,7 @@ double mg_time() {
  * All rights reserved
  */
 
-#ifndef MG_DISABLE_SOCKET_IF
+#if !defined(MG_DISABLE_SOCKET_IF) && !defined(MG_SOCKET_SIMPLELINK)
 
 /* Amalgamated: #include "mongoose/src/internal.h" */
 /* Amalgamated: #include "mongoose/src/util.h" */
@@ -3130,8 +3157,9 @@ double mg_time() {
 #define MG_TCP_RECV_BUFFER_SIZE 1024
 #define MG_UDP_RECV_BUFFER_SIZE 1500
 
-static sock_t mg_open_listening_socket(union socket_address *sa, int proto);
-#ifdef MG_ENABLE_SSL
+static sock_t mg_open_listening_socket(union socket_address *sa, int type,
+                                       int proto);
+#if defined(MG_ENABLE_SSL)
 static void mg_ssl_begin(struct mg_connection *nc);
 static int mg_ssl_err(struct mg_connection *conn, int res);
 #endif
@@ -3140,26 +3168,15 @@ void mg_set_non_blocking_mode(sock_t sock) {
 #ifdef _WIN32
   unsigned long on = 1;
   ioctlsocket(sock, FIONBIO, &on);
-#elif defined(MG_SOCKET_SIMPLELINK)
-  SlSockNonblocking_t opt;
-  opt.NonblockingEnabled = 1;
-  sl_SetSockOpt(sock, SL_SOL_SOCKET, SL_SO_NONBLOCKING, &opt, sizeof(opt));
 #else
   int flags = fcntl(sock, F_GETFL, 0);
   fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 #endif
 }
 
-int mg_is_error(int n) {
-#ifdef MG_SOCKET_SIMPLELINK
-  DBG(("n = %d, errno = %d", n, errno));
-  if (n < 0) errno = n;
-#endif
+static int mg_is_error(int n) {
   return n == 0 || (n < 0 && errno != EINTR && errno != EINPROGRESS &&
                     errno != EAGAIN && errno != EWOULDBLOCK
-#ifdef MG_SOCKET_SIMPLELINK
-                    && errno != SL_EALREADY
-#endif
 #ifdef _WIN32
                     && WSAGetLastError() != WSAEINTR &&
                     WSAGetLastError() != WSAEWOULDBLOCK
@@ -3169,18 +3186,18 @@ int mg_is_error(int n) {
 
 void mg_if_connect_tcp(struct mg_connection *nc,
                        const union socket_address *sa) {
-  int rc;
-  nc->sock = socket(AF_INET, SOCK_STREAM, 0);
+  int rc, proto = 0;
+  nc->sock = socket(AF_INET, SOCK_STREAM, proto);
   if (nc->sock == INVALID_SOCKET) {
     nc->err = errno ? errno : 1;
     return;
   }
-#if !defined(MG_SOCKET_SIMPLELINK) && !defined(MG_ESP8266)
+#if !defined(MG_ESP8266)
   mg_set_non_blocking_mode(nc->sock);
 #endif
   rc = connect(nc->sock, &sa->sa, sizeof(sa->sin));
   nc->err = mg_is_error(rc) ? errno : 0;
-  DBG(("%p sock %d err %d", nc, nc->sock, nc->err));
+  LOG(LL_INFO, ("%p sock %d err %d", nc, nc->sock, nc->err));
 }
 
 void mg_if_connect_udp(struct mg_connection *nc) {
@@ -3193,7 +3210,8 @@ void mg_if_connect_udp(struct mg_connection *nc) {
 }
 
 int mg_if_listen_tcp(struct mg_connection *nc, union socket_address *sa) {
-  sock_t sock = mg_open_listening_socket(sa, SOCK_STREAM);
+  int proto = 0;
+  sock_t sock = mg_open_listening_socket(sa, SOCK_STREAM, proto);
   if (sock == INVALID_SOCKET) {
     return (errno ? errno : 1);
   }
@@ -3202,7 +3220,7 @@ int mg_if_listen_tcp(struct mg_connection *nc, union socket_address *sa) {
 }
 
 int mg_if_listen_udp(struct mg_connection *nc, union socket_address *sa) {
-  sock_t sock = mg_open_listening_socket(sa, SOCK_DGRAM);
+  sock_t sock = mg_open_listening_socket(sa, SOCK_DGRAM, 0);
   if (sock == INVALID_SOCKET) return (errno ? errno : 1);
   mg_sock_set(nc, sock);
   return 0;
@@ -3234,13 +3252,6 @@ void mg_if_destroy_conn(struct mg_connection *nc) {
     /* Only close outgoing UDP sockets or listeners. */
     if (nc->listener == NULL) closesocket(nc->sock);
   }
-  /*
-   * avoid users accidentally double close a socket
-   * because it can lead to difficult to debug situations.
-   * It would happen only if reusing a destroyed mg_connection
-   * but it's not always possible to run the code through an
-   * address sanitizer.
-   */
   nc->sock = INVALID_SOCKET;
 }
 
@@ -3262,7 +3273,7 @@ static int mg_accept_conn(struct mg_connection *lc) {
   DBG(("%p conn from %s:%d", nc, inet_ntoa(sa.sin.sin_addr),
        ntohs(sa.sin.sin_port)));
   mg_sock_set(nc, sock);
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL)
   if (lc->ssl_ctx != NULL) {
     nc->ssl = SSL_new(lc->ssl_ctx);
     if (nc->ssl == NULL || SSL_set_fd(nc->ssl, sock) != 1) {
@@ -3278,17 +3289,17 @@ static int mg_accept_conn(struct mg_connection *lc) {
 }
 
 /* 'sa' must be an initialized address to bind to */
-static sock_t mg_open_listening_socket(union socket_address *sa, int proto) {
+static sock_t mg_open_listening_socket(union socket_address *sa, int type,
+                                       int proto) {
   socklen_t sa_len =
       (sa->sa.sa_family == AF_INET) ? sizeof(sa->sin) : sizeof(sa->sin6);
   sock_t sock = INVALID_SOCKET;
-#if !defined(MG_SOCKET_SIMPLELINK) && !defined(MG_LWIP)
+#if !defined(MG_LWIP)
   int on = 1;
 #endif
 
-  if ((sock = socket(sa->sa.sa_family, proto, 0)) != INVALID_SOCKET &&
-#if !defined(MG_SOCKET_SIMPLELINK) && \
-    !defined(MG_LWIP) /* SimpleLink and LWIP don't support either */
+  if ((sock = socket(sa->sa.sa_family, type, proto)) != INVALID_SOCKET &&
+#if !defined(MG_LWIP) /* LWIP doesn't support either */
 #if defined(_WIN32) && defined(SO_EXCLUSIVEADDRUSE)
       /* "Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE" http://goo.gl/RmrFTm */
       !setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (void *) &on,
@@ -3307,12 +3318,11 @@ static sock_t mg_open_listening_socket(union socket_address *sa, int proto) {
        */
       !setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *) &on, sizeof(on)) &&
 #endif
-#endif /* !MG_SOCKET_SIMPLELINK && !MG_LWIP */
+#endif /* !MG_LWIP */
 
       !bind(sock, &sa->sa, sa_len) &&
-      (proto == SOCK_DGRAM || listen(sock, SOMAXCONN) == 0)) {
-#if !defined(MG_SOCKET_SIMPLELINK) && \
-    !defined(MG_LWIP) /* TODO(rojer): Fix this. */
+      (type == SOCK_DGRAM || listen(sock, SOMAXCONN) == 0)) {
+#if !defined(MG_LWIP)
     mg_set_non_blocking_mode(sock);
     /* In case port was set to 0, get the real port number */
     (void) getsockname(sock, &sa->sa, &sa_len);
@@ -3343,12 +3353,12 @@ static void mg_write_to_socket(struct mg_connection *nc) {
          inet_ntoa(nc->sa.sin.sin_addr), ntohs(nc->sa.sin.sin_port)));
     if (n > 0) {
       mbuf_remove(io, n);
+      mg_if_sent_cb(nc, n);
     }
-    mg_if_sent_cb(nc, n);
     return;
   }
 
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL)
   if (nc->ssl != NULL) {
     if (nc->flags & MG_F_SSL_HANDSHAKE_DONE) {
       n = SSL_write(nc->ssl, io->buf, io->len);
@@ -3376,8 +3386,8 @@ static void mg_write_to_socket(struct mg_connection *nc) {
 
   if (n > 0) {
     mbuf_remove(io, n);
+    mg_if_sent_cb(nc, n);
   }
-  mg_if_sent_cb(nc, n);
 }
 
 MG_INTERNAL size_t recv_avail_size(struct mg_connection *conn, size_t max) {
@@ -3387,7 +3397,7 @@ MG_INTERNAL size_t recv_avail_size(struct mg_connection *conn, size_t max) {
   return avail > max ? max : avail;
 }
 
-static void mg_read_from_socket(struct mg_connection *conn) {
+static void mg_handle_tcp_read(struct mg_connection *conn) {
   int n = 0;
   char *buf = (char *) MG_MALLOC(MG_TCP_RECV_BUFFER_SIZE);
 
@@ -3396,7 +3406,7 @@ static void mg_read_from_socket(struct mg_connection *conn) {
     return;
   }
 
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL)
   if (conn->ssl != NULL) {
     if (conn->flags & MG_F_SSL_HANDSHAKE_DONE) {
       /* SSL library may have more bytes ready to read then we ask to read.
@@ -3464,7 +3474,7 @@ static void mg_handle_udp_read(struct mg_connection *nc) {
   mg_if_recv_udp_cb(nc, buf, n, &sa, sa_len);
 }
 
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL)
 static int mg_ssl_err(struct mg_connection *conn, int res) {
   int ssl_err = SSL_get_error(conn->ssl, res);
   DBG(("%p %d -> %d", conn, res, ssl_err));
@@ -3507,7 +3517,7 @@ static void mg_ssl_begin(struct mg_connection *nc) {
     }
   }
 }
-#endif /* MG_ENABLE_SSL */
+#endif /* defined(MG_ENABLE_SSL) */
 
 #define _MG_F_FD_CAN_READ 1
 #define _MG_F_FD_CAN_WRITE 1 << 1
@@ -3520,7 +3530,7 @@ void mg_mgr_handle_conn(struct mg_connection *nc, int fd_flags, double now) {
   if (nc->flags & MG_F_CONNECTING) {
     if (fd_flags != 0) {
       int err = 0;
-#if !defined(MG_SOCKET_SIMPLELINK) && !defined(MG_ESP8266)
+#if !defined(MG_ESP8266)
       if (!(nc->flags & MG_F_UDP)) {
         socklen_t len = sizeof(err);
         int ret =
@@ -3529,12 +3539,11 @@ void mg_mgr_handle_conn(struct mg_connection *nc, int fd_flags, double now) {
       }
 #else
       /*
-       * On SimpleLink and ESP8266 we use blocking connect.
-       * TODO(rojer): Figure out why it fails where blocking succeeds.
+       * On ESP8266 we use blocking connect.
        */
       err = nc->err;
 #endif
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL)
       if (nc->ssl != NULL && err == 0) {
         SSL_set_fd(nc->ssl, nc->sock);
         mg_ssl_begin(nc);
@@ -3559,9 +3568,9 @@ void mg_mgr_handle_conn(struct mg_connection *nc, int fd_flags, double now) {
          * a time. The reason is that eCos does not respect non-blocking
          * flag on a listening socket and hangs in a loop.
          */
-        if (fd_flags & _MG_F_FD_CAN_READ) mg_accept_conn(nc);
+        mg_accept_conn(nc);
       } else {
-        mg_read_from_socket(nc);
+        mg_handle_tcp_read(nc);
       }
     }
   }
@@ -3744,13 +3753,6 @@ time_t mg_mgr_poll(struct mg_mgr *mgr, int timeout_ms) {
                    (FD_ISSET(nc->sock, &write_set) ? _MG_F_FD_CAN_WRITE : 0) |
                    (FD_ISSET(nc->sock, &err_set) ? _MG_F_FD_ERROR : 0);
       }
-#ifdef MG_SOCKET_SIMPLELINK
-      /* SimpleLink does not report UDP sockets as writeable. */
-      if (nc->flags & MG_F_UDP &&
-          (nc->send_mbuf.len > 0 || nc->flags & MG_F_CONNECTING)) {
-        fd_flags |= _MG_F_FD_CAN_WRITE;
-      }
-#endif
 #ifdef MG_LWIP
       /* With LWIP socket emulation layer, we don't get write events */
       fd_flags |= _MG_F_FD_CAN_WRITE;
@@ -3815,7 +3817,6 @@ int mg_socketpair(sock_t sp[2], int sock_type) {
 }
 #endif /* MG_DISABLE_SOCKETPAIR */
 
-#ifndef MG_SOCKET_SIMPLELINK
 static void mg_sock_get_addr(sock_t sock, int remote,
                              union socket_address *sa) {
   socklen_t slen = sizeof(*sa);
@@ -3832,21 +3833,13 @@ void mg_sock_to_str(sock_t sock, char *buf, size_t len, int flags) {
   mg_sock_get_addr(sock, flags & MG_SOCK_STRINGIFY_REMOTE, &sa);
   mg_sock_addr_to_str(&sa, buf, len, flags);
 }
-#endif
 
 void mg_if_get_conn_addr(struct mg_connection *nc, int remote,
                          union socket_address *sa) {
-#ifndef MG_SOCKET_SIMPLELINK
   mg_sock_get_addr(nc->sock, remote, sa);
-#else
-  /* SimpleLink does not provide a way to get socket's peer address after
-   * accept or connect. Address hould have been preserved in the connection,
-   * so we do our best here by using it. */
-  if (remote) memcpy(sa, &nc->sa, sizeof(*sa));
-#endif
 }
 
-#endif /* !MG_DISABLE_SOCKET_IF */
+#endif /* !defined(MG_DISABLE_SOCKET_IF) && !defined(MG_SOCKET_SIMPLELINK) */
 #ifdef MG_MODULE_LINES
 #line 1 "./src/multithreading.c"
 #endif
@@ -7233,7 +7226,11 @@ static void mg_prepare_cgi_environment(struct mg_connection *nc,
     mg_addenv(blk, "PATH_TRANSLATED=%.*s", (int) path_info->len, path_info->p);
   }
 
+#ifdef MG_ENABLE_SSL
   mg_addenv(blk, "HTTPS=%s", nc->ssl != NULL ? "on" : "off");
+#else
+  mg_addenv(blk, "HTTPS=off");
+#endif
 
   if ((h = mg_get_http_header((struct http_message *) hm, "Content-Type")) !=
       NULL) {
@@ -7708,9 +7705,14 @@ struct mg_connection *mg_connect_http_base(
     return NULL;
   }
 #endif
+#if defined(MG_ENABLE_SSL) && defined(MG_SOCKET_SIMPLELINK)
+  if (use_ssl && opts.ssl_ca_cert == NULL) {
+    opts.ssl_ca_cert = "";
+  }
+#endif
 
   if ((nc = mg_connect_opt(mgr, *addr, ev_handler, opts)) != NULL) {
-#ifdef MG_ENABLE_SSL
+#if defined(MG_ENABLE_SSL) && !defined(MG_SOCKET_SIMPLELINK)
     if (use_ssl && nc->ssl_ctx == NULL) {
       /*
        * Schema requires SSL, but no SSL parameters were provided in
@@ -11001,7 +11003,7 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
 
 char *inet_ntoa(struct in_addr n) {
   static char a[16];
-  return (char *) inet_ntop(AF_INET, &n, a, sizeof(n));
+  return (char *) inet_ntop(AF_INET, &n, a, sizeof(a));
 }
 
 int inet_pton(int af, const char *src, void *dst) {
@@ -11076,3 +11078,491 @@ void mg_run_in_task(void (*cb)(struct mg_mgr *mgr, void *arg), void *cb_arg) {
 }
 
 #endif /* defined(MG_SOCKET_SIMPLELINK) */
+#ifdef MG_MODULE_LINES
+#line 1 "./src/../../common/platforms/simplelink/sl_net_if.c"
+#endif
+/*
+ * Copyright (c) 2014-2016 Cesanta Software Limited
+ * All rights reserved
+ */
+
+#if !defined(MG_DISABLE_SOCKET_IF) && defined(MG_SOCKET_SIMPLELINK)
+
+/* Amalgamated: #include "mongoose/src/internal.h" */
+/* Amalgamated: #include "mongoose/src/util.h" */
+
+#define MG_TCP_RECV_BUFFER_SIZE 1024
+#define MG_UDP_RECV_BUFFER_SIZE 1500
+
+static sock_t mg_open_listening_socket(union socket_address *sa, int type,
+                                       int proto);
+
+#ifdef MG_ENABLE_SSL
+const char *mg_set_ssl2(struct mg_connection *nc, const char *cert,
+                        const char *key, const char *ca_cert) {
+  DBG(("%p %s,%s,%s", nc, (cert ? cert : ""), (key ? key : ""),
+       (ca_cert ? ca_cert : "")));
+
+  if (nc->flags & MG_F_UDP) {
+    return "SSL for UDP is not supported";
+  }
+
+  if (cert != NULL || key != NULL) {
+    if (cert != NULL && key != NULL) {
+      nc->ssl_cert = strdup(cert);
+      nc->ssl_key = strdup(key);
+    } else {
+      return "both cert and key are required";
+    }
+  }
+  if (ca_cert != NULL) nc->ssl_ca_cert = strdup(ca_cert);
+
+  nc->flags |= MG_F_SSL;
+
+  return NULL;
+}
+
+int sl_set_ssl_opts(struct mg_connection *nc) {
+  int err;
+  DBG(("%p %s,%s,%s,%s", nc, (nc->ssl_cert ? nc->ssl_cert : ""),
+       (nc->ssl_key ? nc->ssl_cert : ""),
+       (nc->ssl_ca_cert ? nc->ssl_ca_cert : ""),
+       (nc->ssl_server_name ? nc->ssl_server_name : "")));
+  if (nc->ssl_cert != NULL && nc->ssl_key != NULL) {
+    err = sl_SetSockOpt(nc->sock, SL_SOL_SOCKET,
+                        SL_SO_SECURE_FILES_CERTIFICATE_FILE_NAME, nc->ssl_cert,
+                        strlen(nc->ssl_cert));
+    DBG(("CERTIFICATE_FILE_NAME %s -> %d", nc->ssl_cert, nc->err));
+    if (err != 0) return err;
+    err = sl_SetSockOpt(nc->sock, SL_SOL_SOCKET,
+                        SL_SO_SECURE_FILES_PRIVATE_KEY_FILE_NAME, nc->ssl_key,
+                        strlen(nc->ssl_key));
+    DBG(("PRIVATE_KEY_FILE_NAME %s -> %d", nc->ssl_key, nc->err));
+    if (err != 0) return err;
+    MG_FREE(nc->ssl_cert);
+    MG_FREE(nc->ssl_key);
+    nc->ssl_cert = nc->ssl_key = NULL;
+  }
+  if (nc->ssl_ca_cert != NULL) {
+    if (nc->ssl_ca_cert[0] != '\0') {
+      err = sl_SetSockOpt(nc->sock, SL_SOL_SOCKET,
+                          SL_SO_SECURE_FILES_CA_FILE_NAME, nc->ssl_ca_cert,
+                          strlen(nc->ssl_ca_cert));
+      DBG(("CA_FILE_NAME %s -> %d", nc->ssl_ca_cert, nc->err));
+      if (err != 0) return err;
+    }
+    MG_FREE(nc->ssl_ca_cert);
+    nc->ssl_ca_cert = NULL;
+  }
+  if (nc->ssl_server_name != NULL) {
+    err = sl_SetSockOpt(nc->sock, SL_SOL_SOCKET,
+                        SO_SECURE_DOMAIN_NAME_VERIFICATION, nc->ssl_server_name,
+                        strlen(nc->ssl_server_name));
+    DBG(("DOMAIN_NAME_VERIFICATION %s -> %d", nc->ssl_server_name, nc->err));
+    if (err != 0) return err;
+    MG_FREE(nc->ssl_server_name);
+    nc->ssl_server_name = NULL;
+  }
+  return 0;
+}
+#endif
+
+void mg_set_non_blocking_mode(sock_t sock) {
+  SlSockNonblocking_t opt;
+  opt.NonblockingEnabled = 1;
+  sl_SetSockOpt(sock, SL_SOL_SOCKET, SL_SO_NONBLOCKING, &opt, sizeof(opt));
+}
+
+static int mg_is_error(int n) {
+  return (n < 0 && n != SL_EALREADY);
+}
+
+void mg_if_connect_tcp(struct mg_connection *nc,
+                       const union socket_address *sa) {
+  int proto = 0;
+  if (nc->flags & MG_F_SSL) proto = SL_SEC_SOCKET;
+  sock_t sock = sl_Socket(AF_INET, SOCK_STREAM, proto);
+  if (sock < 0) {
+    nc->err = sock;
+    goto out;
+  }
+  mg_sock_set(nc, sock);
+#ifdef MG_ENABLE_SSL
+  nc->err = sl_set_ssl_opts(nc);
+  if (nc->err != 0) goto out;
+#endif
+  nc->err = sl_Connect(sock, &sa->sa, sizeof(sa->sin));
+out:
+  LOG(LL_INFO, ("%p sock %d err %d", nc, nc->sock, nc->err));
+}
+
+void mg_if_connect_udp(struct mg_connection *nc) {
+  sock_t sock = sl_Socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
+    nc->err = sock;
+    return;
+  }
+  mg_sock_set(nc, sock);
+  nc->err = 0;
+}
+
+int mg_if_listen_tcp(struct mg_connection *nc, union socket_address *sa) {
+  int proto = 0;
+  if (nc->flags & MG_F_SSL) proto = SL_SEC_SOCKET;
+  sock_t sock = mg_open_listening_socket(sa, SOCK_STREAM, proto);
+  if (sock == INVALID_SOCKET) {
+    return (errno ? errno : 1);
+  }
+  mg_sock_set(nc, sock);
+#ifdef MG_ENABLE_SSL
+  return sl_set_ssl_opts(nc);
+#else
+  return 0;
+#endif
+}
+
+int mg_if_listen_udp(struct mg_connection *nc, union socket_address *sa) {
+  sock_t sock = mg_open_listening_socket(sa, SOCK_DGRAM, 0);
+  if (sock == INVALID_SOCKET) return (errno ? errno : 1);
+  mg_sock_set(nc, sock);
+  return 0;
+}
+
+void mg_if_tcp_send(struct mg_connection *nc, const void *buf, size_t len) {
+  mbuf_append(&nc->send_mbuf, buf, len);
+}
+
+void mg_if_udp_send(struct mg_connection *nc, const void *buf, size_t len) {
+  mbuf_append(&nc->send_mbuf, buf, len);
+}
+
+void mg_if_recved(struct mg_connection *nc, size_t len) {
+  (void) nc;
+  (void) len;
+}
+
+int mg_if_create_conn(struct mg_connection *nc) {
+  (void) nc;
+  return 1;
+}
+
+void mg_if_destroy_conn(struct mg_connection *nc) {
+  if (nc->sock == INVALID_SOCKET) return;
+  if (!(nc->flags & MG_F_UDP)) {
+    sl_Close(nc->sock);
+  } else {
+    /* Only close outgoing UDP sockets or listeners. */
+    if (nc->listener == NULL) sl_Close(nc->sock);
+  }
+  nc->sock = INVALID_SOCKET;
+#ifdef MG_ENABLE_SSL
+  MG_FREE(nc->ssl_cert);
+  MG_FREE(nc->ssl_key);
+  MG_FREE(nc->ssl_ca_cert);
+  MG_FREE(nc->ssl_server_name);
+#endif
+}
+
+static int mg_accept_conn(struct mg_connection *lc) {
+  struct mg_connection *nc;
+  union socket_address sa;
+  socklen_t sa_len = sizeof(sa);
+  sock_t sock = sl_Accept(lc->sock, &sa.sa, &sa_len);
+  if (sock < 0) {
+    DBG(("%p: failed to accept: %d", lc, sock));
+    return 0;
+  }
+  nc = mg_if_accept_new_conn(lc);
+  if (nc == NULL) {
+    sl_Close(sock);
+    return 0;
+  }
+  DBG(("%p conn from %s:%d", nc, inet_ntoa(sa.sin.sin_addr),
+       ntohs(sa.sin.sin_port)));
+  mg_sock_set(nc, sock);
+  if (nc->flags & MG_F_SSL) nc->flags |= MG_F_SSL_HANDSHAKE_DONE;
+  mg_if_accept_tcp_cb(nc, &sa, sa_len);
+  return 1;
+}
+
+/* 'sa' must be an initialized address to bind to */
+static sock_t mg_open_listening_socket(union socket_address *sa, int type,
+                                       int proto) {
+  socklen_t sa_len =
+      (sa->sa.sa_family == AF_INET) ? sizeof(sa->sin) : sizeof(sa->sin6);
+  sock_t sock = sl_Socket(sa->sa.sa_family, type, proto);
+  if (sock < 0) return INVALID_SOCKET;
+  if (bind(sock, &sa->sa, sa_len) < 0) {
+    sl_Close(sock);
+    return INVALID_SOCKET;
+  }
+  if (type != SOCK_DGRAM && sl_Listen(sock, SOMAXCONN) < 0) {
+    sl_Close(sock);
+    return INVALID_SOCKET;
+  }
+  mg_set_non_blocking_mode(sock);
+  return sock;
+}
+
+static void mg_write_to_socket(struct mg_connection *nc) {
+  struct mbuf *io = &nc->send_mbuf;
+  int n = 0;
+
+  if (nc->flags & MG_F_UDP) {
+    int n = sl_SendTo(nc->sock, io->buf, io->len, 0, &nc->sa.sa,
+                      sizeof(nc->sa.sin));
+    DBG(("%p %d %d %d %s:%hu", nc, nc->sock, n, errno,
+         inet_ntoa(nc->sa.sin.sin_addr), ntohs(nc->sa.sin.sin_port)));
+    if (n > 0) mbuf_remove(io, n);
+    mg_if_sent_cb(nc, n);
+    return;
+  } else {
+    n = (int) sl_Send(nc->sock, io->buf, io->len, 0);
+    DBG(("%p %d bytes -> %d", nc, n, nc->sock));
+    if (n < 0 && !mg_is_error(n)) return;
+  }
+
+  if (n > 0) {
+    mbuf_remove(io, n);
+    mg_if_sent_cb(nc, n);
+  }
+}
+
+MG_INTERNAL size_t recv_avail_size(struct mg_connection *conn, size_t max) {
+  size_t avail;
+  if (conn->recv_mbuf_limit < conn->recv_mbuf.len) return 0;
+  avail = conn->recv_mbuf_limit - conn->recv_mbuf.len;
+  return avail > max ? max : avail;
+}
+
+static void mg_handle_tcp_read(struct mg_connection *conn) {
+  int n = 0;
+  char *buf = (char *) MG_MALLOC(MG_TCP_RECV_BUFFER_SIZE);
+
+  if (buf == NULL) {
+    DBG(("OOM"));
+    return;
+  }
+
+  n = (int) sl_Recv(conn->sock, buf,
+                    recv_avail_size(conn, MG_TCP_RECV_BUFFER_SIZE), 0);
+  DBG(("%p %d bytes <- %d", conn, n, conn->sock));
+  if (n > 0) {
+    mg_if_recv_tcp_cb(conn, buf, n);
+  } else {
+    MG_FREE(buf);
+  }
+  if (n == 0) {
+    /* Orderly shutdown of the socket, try flushing output. */
+    conn->flags |= MG_F_SEND_AND_CLOSE;
+  } else if (mg_is_error(n)) {
+    conn->flags |= MG_F_CLOSE_IMMEDIATELY;
+  }
+}
+
+static void mg_handle_udp_read(struct mg_connection *nc) {
+  char *buf = (char *) MG_MALLOC(MG_UDP_RECV_BUFFER_SIZE);
+  if (buf == NULL) return;
+  union socket_address sa;
+  socklen_t sa_len = sizeof(sa);
+  int n = sl_RecvFrom(nc->sock, buf, MG_UDP_RECV_BUFFER_SIZE, 0,
+                      (SlSockAddr_t *) &sa, &sa_len);
+  DBG(("%p %d bytes from %s:%d", nc, n, inet_ntoa(nc->sa.sin.sin_addr),
+       ntohs(nc->sa.sin.sin_port)));
+  if (n > 0) {
+    mg_if_recv_udp_cb(nc, buf, n, &sa, sa_len);
+  } else {
+    MG_FREE(buf);
+  }
+}
+
+#define _MG_F_FD_CAN_READ 1
+#define _MG_F_FD_CAN_WRITE 1 << 1
+#define _MG_F_FD_ERROR 1 << 2
+
+void mg_mgr_handle_conn(struct mg_connection *nc, int fd_flags, double now) {
+  DBG(("%p fd=%d fd_flags=%d nc_flags=%lu rmbl=%d smbl=%d", nc, nc->sock,
+       fd_flags, nc->flags, (int) nc->recv_mbuf.len, (int) nc->send_mbuf.len));
+
+  if (nc->flags & MG_F_CONNECTING) {
+    if (nc->flags & MG_F_UDP || nc->err != SL_EALREADY) {
+      mg_if_connect_cb(nc, nc->err);
+    } else {
+      /* In SimpleLink, to get status of non-blocking connect() we need to wait
+       * until socket is writable and repeat the call to sl_Connect again,
+       * which will now return the real status. */
+      if (fd_flags & _MG_F_FD_CAN_WRITE) {
+        nc->err = sl_Connect(nc->sock, &nc->sa.sa, sizeof(nc->sa.sin));
+        if (nc->err == SL_ESECSNOVERIFY ||
+            /* TODO(rojer): Provide API to set the date for verification. */
+            nc->err == SL_ESECDATEERROR) {
+          nc->err = 0;
+        }
+        if (nc->flags & MG_F_SSL && nc->err == 0) {
+          nc->flags |= MG_F_SSL_HANDSHAKE_DONE;
+        }
+        mg_if_connect_cb(nc, nc->err);
+      }
+    }
+    /* Ignore read/write in further processing, we've handled it. */
+    fd_flags &= ~(_MG_F_FD_CAN_READ | _MG_F_FD_CAN_WRITE);
+  }
+
+  if (fd_flags & _MG_F_FD_CAN_READ) {
+    if (nc->flags & MG_F_UDP) {
+      mg_handle_udp_read(nc);
+    } else {
+      if (nc->flags & MG_F_LISTENING) {
+        mg_accept_conn(nc);
+      } else {
+        mg_handle_tcp_read(nc);
+      }
+    }
+  }
+
+  if (!(nc->flags & MG_F_CLOSE_IMMEDIATELY)) {
+    if ((fd_flags & _MG_F_FD_CAN_WRITE) && nc->send_mbuf.len > 0) {
+      mg_write_to_socket(nc);
+    }
+
+    if (!(fd_flags & (_MG_F_FD_CAN_READ | _MG_F_FD_CAN_WRITE))) {
+      mg_if_poll(nc, now);
+    }
+    mg_if_timer(nc, now);
+  }
+
+  DBG(("%p after fd=%d nc_flags=%lu rmbl=%d smbl=%d", nc, nc->sock, nc->flags,
+       (int) nc->recv_mbuf.len, (int) nc->send_mbuf.len));
+}
+
+/* Associate a socket to a connection. */
+void mg_sock_set(struct mg_connection *nc, sock_t sock) {
+  mg_set_non_blocking_mode(sock);
+  nc->sock = sock;
+  DBG(("%p %d", nc, sock));
+}
+
+void mg_ev_mgr_init(struct mg_mgr *mgr) {
+  (void) mgr;
+  DBG(("%p using sl_Select()", mgr));
+}
+
+void mg_ev_mgr_free(struct mg_mgr *mgr) {
+  (void) mgr;
+}
+
+void mg_ev_mgr_add_conn(struct mg_connection *nc) {
+  (void) nc;
+}
+
+void mg_ev_mgr_remove_conn(struct mg_connection *nc) {
+  (void) nc;
+}
+
+time_t mg_mgr_poll(struct mg_mgr *mgr, int timeout_ms) {
+  double now = mg_time();
+  double min_timer;
+  struct mg_connection *nc, *tmp;
+  struct SlTimeval_t tv;
+  fd_set read_set, write_set, err_set;
+  sock_t max_fd = INVALID_SOCKET;
+  int num_fds, num_ev, num_timers = 0;
+
+  FD_ZERO(&read_set);
+  FD_ZERO(&write_set);
+  FD_ZERO(&err_set);
+
+  /*
+   * Note: it is ok to have connections with sock == INVALID_SOCKET in the list,
+   * e.g. timer-only "connections".
+   */
+  min_timer = 0;
+  for (nc = mgr->active_connections, num_fds = 0; nc != NULL; nc = tmp) {
+    tmp = nc->next;
+
+    if (nc->sock != INVALID_SOCKET) {
+      num_fds++;
+
+      if (!(nc->flags & MG_F_WANT_WRITE) &&
+          nc->recv_mbuf.len < nc->recv_mbuf_limit &&
+          (!(nc->flags & MG_F_UDP) || nc->listener == NULL)) {
+        FD_SET(nc->sock, &read_set);
+        if (max_fd == INVALID_SOCKET || nc->sock > max_fd) max_fd = nc->sock;
+      }
+
+      if (((nc->flags & MG_F_CONNECTING) && !(nc->flags & MG_F_WANT_READ)) ||
+          (nc->send_mbuf.len > 0 && !(nc->flags & MG_F_CONNECTING))) {
+        FD_SET(nc->sock, &write_set);
+        FD_SET(nc->sock, &err_set);
+        if (max_fd == INVALID_SOCKET || nc->sock > max_fd) max_fd = nc->sock;
+      }
+    }
+
+    if (nc->ev_timer_time > 0) {
+      if (num_timers == 0 || nc->ev_timer_time < min_timer) {
+        min_timer = nc->ev_timer_time;
+      }
+      num_timers++;
+    }
+  }
+
+  /*
+   * If there is a timer to be fired earlier than the requested timeout,
+   * adjust the timeout.
+   */
+  if (num_timers > 0) {
+    double timer_timeout_ms = (min_timer - mg_time()) * 1000 + 1 /* rounding */;
+    if (timer_timeout_ms < timeout_ms) {
+      timeout_ms = timer_timeout_ms;
+    }
+  }
+  if (timeout_ms < 0) timeout_ms = 0;
+
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+  num_ev = sl_Select((int) max_fd + 1, &read_set, &write_set, &err_set, &tv);
+  now = mg_time();
+  DBG(("sl_Select @ %ld num_ev=%d of %d, timeout=%d", (long) now, num_ev, num_fds,
+       timeout_ms));
+
+  for (nc = mgr->active_connections; nc != NULL; nc = tmp) {
+    int fd_flags = 0;
+    if (nc->sock != INVALID_SOCKET) {
+      if (num_ev > 0) {
+        fd_flags = (FD_ISSET(nc->sock, &read_set) &&
+                            (!(nc->flags & MG_F_UDP) || nc->listener == NULL)
+                        ? _MG_F_FD_CAN_READ
+                        : 0) |
+                   (FD_ISSET(nc->sock, &write_set) ? _MG_F_FD_CAN_WRITE : 0) |
+                   (FD_ISSET(nc->sock, &err_set) ? _MG_F_FD_ERROR : 0);
+      }
+      /* SimpleLink does not report UDP sockets as writeable. */
+      if (nc->flags & MG_F_UDP && nc->send_mbuf.len > 0) {
+        fd_flags |= _MG_F_FD_CAN_WRITE;
+      }
+    }
+    tmp = nc->next;
+    mg_mgr_handle_conn(nc, fd_flags, now);
+  }
+
+  for (nc = mgr->active_connections; nc != NULL; nc = tmp) {
+    tmp = nc->next;
+    if ((nc->flags & MG_F_CLOSE_IMMEDIATELY) ||
+        (nc->send_mbuf.len == 0 && (nc->flags & MG_F_SEND_AND_CLOSE))) {
+      mg_close_conn(nc);
+    }
+  }
+
+  return now;
+}
+
+void mg_if_get_conn_addr(struct mg_connection *nc, int remote,
+                         union socket_address *sa) {
+  /* SimpleLink does not provide a way to get socket's peer address after
+   * accept or connect. Address hould have been preserved in the connection,
+   * so we do our best here by using it. */
+  if (remote) memcpy(sa, &nc->sa, sizeof(*sa));
+}
+
+#endif /* !defined(MG_DISABLE_SOCKET_IF) && defined(MG_SOCKET_SIMPLELINK) */
