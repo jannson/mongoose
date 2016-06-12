@@ -5,6 +5,7 @@
 
 #include "../../mongoose.h"
 #include <sys/queue.h>
+#include "dbapi.h"
 
 #define MAX_IDLE_CONNS 5
 #define CONN_IDLE_TIMEOUT 30
@@ -432,6 +433,58 @@ static void ev_handler_https(struct mg_connection *nc, int ev, void *ev_data) {
     ev_handler(nc, ev, ev_data, 1);
 }
 
+static int process_json(struct mg_connection *nc, struct http_message *hm) {
+    int i, n, dst_len = 4096;
+    struct json_token tokens[200] = {0};
+    const char* buf = hm->body.p;
+    int len = hm->body.len;
+    char dst[4096];
+    struct json_token *params, *fields;
+    dbclient client;
+
+    if(0 == mg_vcasecmp(&hm->method, "POST")) {
+        n = parse_json(buf, len, tokens, sizeof(tokens) / sizeof(tokens[0]));
+        if (n <= 0) {
+            return -1;
+        }
+
+        /* for(i = 0; i < 200; i++) {
+            if (tokens[i].ptr != NULL) {
+                memcpy(dst, tokens[i].ptr, tokens[i].len);
+                dst[tokens[i].len] = '\0';
+                printf("token i=%d len=%d dst=%s\n", i, tokens[i].len, dst);
+            }
+        } */
+
+        params = find_json_token(tokens, "params");
+        fields = find_json_token(tokens, "fields");
+        if(params == NULL || fields == NULL || JSON_TYPE_ARRAY != params->type || JSON_TYPE_OBJECT != fields->type) {
+            return -5;
+        }
+
+        for(i = 0; i < params[0].num_desc; i++) {
+            n = i+1;
+            memcpy(dst, params[n].ptr, params[n].len);
+            dst[params[n].len] = '\0';
+            printf("token[%d]=%s\n", n, dst);
+        }
+
+        n = (fields[0].num_desc-1)/2;
+        dbclient_start(&client);
+        printf("n=%d\n", n);
+
+        for(i = 0; i <= n; i++) {
+            dbclient_bulk(&client, "set", fields[i*2+1].ptr, fields[i*2+1].len, fields[i*2+2].ptr, fields[i*2+2].len);
+        }
+
+        dbclient_end(&client);
+
+        return -2;
+    }
+
+    return -3;
+}
+
 static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int https) {
   struct conn_data *conn = (struct conn_data *) nc->user_data;
   const time_t now = time(NULL);
@@ -477,8 +530,19 @@ static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int http
 
       if(hm != NULL && has_prefix(&hm->uri, "/_api/")) {
           //printf("json connected\n");
-          mg_printf(nc, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n"
-                    "Content-Type: application/json\r\n\r\n{}");
+          //mg_printf(nc, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n"
+          //          "Content-Type: application/json\r\n\r\n{}");
+
+          process_json(nc, hm);
+
+          /* Send headers */
+          mg_printf(nc, "%s", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                  "Content-Type: application/json\r\n\r\n");
+
+          /* Compute the result and send it back as a JSON object */
+          mg_printf_http_chunk(nc, "{ \"result\": %lf }", 100.0);
+          mg_send_http_chunk(nc, "", 0); /* Send empty chunk, the end of response */
+
           nc->flags |= MG_F_SEND_AND_CLOSE;
           //Set Client.nc to NULL
           conn->client.nc = NULL;
@@ -623,7 +687,7 @@ int main(int argc, char *argv[]) {
   char *r = NULL;
   be->vhost = vhost;
   be->uri_prefix = "/";
-  be->host_port = "192.168.6.1:80";
+  be->host_port = "10.1.1.1:80";
   be->redirect = redirect;
   be->uri_prefix_replacement = be->uri_prefix;
   if ((r = strchr(be->uri_prefix, '=')) != NULL) {
