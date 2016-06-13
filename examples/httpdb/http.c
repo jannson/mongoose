@@ -10,6 +10,10 @@
 #define MAX_IDLE_CONNS 5
 #define CONN_IDLE_TIMEOUT 30
 
+#ifndef MIN
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#endif
+
 // gcc -o http ../../mongoose.c  http.c
 // gcc -DMG_ENABLE_SSL -lssl  -o http ../../mongoose.c  http.c
 // ./load_balancer -p 8090 -l -  -k  -b / 192.168.6.1:80
@@ -434,55 +438,77 @@ static void ev_handler_https(struct mg_connection *nc, int ev, void *ev_data) {
 }
 
 static int process_json(struct mg_connection *nc, struct http_message *hm) {
-    int i, n, dst_len = 4096;
+#define DST_LEN 510
+    int i, n, dst_len = DST_LEN;
     struct json_token tokens[200] = {0};
-    const char* buf = hm->body.p;
-    int len = hm->body.len;
-    char dst[4096];
-    struct json_token *params, *fields;
+    char *buf, dst[DST_LEN+2];
+    struct json_token *method, *params, *fields;
     dbclient client;
 
     if(0 == mg_vcasecmp(&hm->method, "POST")) {
-        n = parse_json(buf, len, tokens, sizeof(tokens) / sizeof(tokens[0]));
+        dst[0] = '\0';
+        buf = dst;
+
+        n = parse_json(hm->body.p, hm->body.len, tokens, sizeof(tokens) / sizeof(tokens[0]));
         if (n <= 0) {
             return -1;
         }
 
-        /* for(i = 0; i < 200; i++) {
-            if (tokens[i].ptr != NULL) {
-                memcpy(dst, tokens[i].ptr, tokens[i].len);
-                dst[tokens[i].len] = '\0';
-                printf("token i=%d len=%d dst=%s\n", i, tokens[i].len, dst);
-            }
-        } */
-
-        params = find_json_token(tokens, "params");
         fields = find_json_token(tokens, "fields");
-        if(params == NULL || fields == NULL || JSON_TYPE_ARRAY != params->type || JSON_TYPE_OBJECT != fields->type) {
-            return -5;
+        if (fields != NULL && JSON_TYPE_OBJECT == fields[0].type && fields[0].num_desc > 0) {
+            n = fields[0].num_desc/2;
+            dbclient_start(&client);
+            //printf("n=%d origin=%d\n", n, fields[0].num_desc);
+
+            for(i = 0; i <= n; i++) {
+                if(fields[i*2+1].len > 0 && fields[i*2+2].len > 0) {
+                    //printf("o1=%d o2=%d\n", fields[i*2+1].len, fields[i*2+2].len);
+                    dbclient_bulk(&client, "set", fields[i*2+1].ptr, fields[i*2+1].len, fields[i*2+2].ptr, fields[i*2+2].len);
+                }
+            }
+
+            dbclient_end(&client);
         }
 
-        for(i = 0; i < params[0].num_desc; i++) {
-            n = i+1;
-            memcpy(dst, params[n].ptr, params[n].len);
-            dst[params[n].len] = '\0';
-            printf("token[%d]=%s\n", n, dst);
+        method = find_json_token(tokens, "method");
+        if(method != NULL && JSON_TYPE_STRING == method[0].type) {
+            if(dst_len < method[0].len) {
+                break;
+            }
+
+            n = method[0].len;
+            memcpy(buf, method[0].ptr, n);
+            buf[n] = ' ';
+            buf[n+1] = '\0';
+            buf += n+1;
+            dst_len -= n+1;
+
+            params = find_json_token(tokens, "params");
+            if(params != NULL && JSON_TYPE_ARRAY == params[0].type && params[0].num_desc > 0) {
+                for(i = 1; i <= params[0].num_desc; i++) {
+                    if(dst_len < params[i].len) {
+                        break;
+                    }
+                    n = params[i].len;
+
+                    if(JSON_TYPE_NUMBER == params[i].type) {
+                        memcpy(buf, params[i].ptr, n); 
+                        buf[n] = ' ';
+                        buf[n+1] = '\0';
+                        buf += n+1;
+                        dst_len -= n+1;
+                    }
+                }
+            }
+
         }
 
-        n = (fields[0].num_desc-1)/2;
-        dbclient_start(&client);
-        printf("n=%d\n", n);
+        printf("dst=%s\n", dst);
 
-        for(i = 0; i <= n; i++) {
-            dbclient_bulk(&client, "set", fields[i*2+1].ptr, fields[i*2+1].len, fields[i*2+2].ptr, fields[i*2+2].len);
-        }
-
-        dbclient_end(&client);
-
-        return -2;
+        return 0;
     }
 
-    return -3;
+    return -2;
 }
 
 static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int https) {
@@ -533,7 +559,7 @@ static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, int http
           //mg_printf(nc, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n"
           //          "Content-Type: application/json\r\n\r\n{}");
 
-          process_json(nc, hm);
+          printf("result=%d\n", process_json(nc, hm));
 
           /* Send headers */
           mg_printf(nc, "%s", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"

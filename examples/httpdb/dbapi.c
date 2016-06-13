@@ -121,6 +121,9 @@ int dbclient_bulk(dbclient* client, char* command, char* key, int nk, char* valu
     int n1,n2,nc;
 
     nc = strlen(command);
+    if(nk <= 0 || nv <= 0) {
+        return -1;
+    }
 
     n1 = nc + nk + nv + 3;// replace key value\n
     check_buf(client, n1 + HEADER_PREFIX);
